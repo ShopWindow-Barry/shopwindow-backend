@@ -18,23 +18,31 @@ app.use(express.static('public')); // Serve static files if needed
 let shoppingCenters = new Map(); // key: shopping_center_name, value: center object
 let tenants = new Map(); // key: center_name + tenant_name (or unique for vacant), value: tenant object
 
-// Census API configuration
+// Census API configuration - UPDATED: Use 2022 data which is definitely available
 const CENSUS_API_KEY = process.env.CENSUS_API_KEY;
-const CENSUS_BASE_URL = 'https://api.census.gov/data/2023/acs/acs5';
+const CENSUS_BASE_URL = 'https://api.census.gov/data/2022/acs/acs5';
 
-// Demographic variables to fetch from Census API
+// UPDATED: Demographic variables with proper Census codes and base populations for percentage calculations
 const DEMOGRAPHIC_VARIABLES = {
     'B01003_001E': 'total_population',
-    'B19013_001E': 'median_household_income',
+    'B19013_001E': 'median_household_income', 
     'B25001_001E': 'total_housing_units',
-    'B08303_013E': 'commute_30_plus_minutes',
-    'B15003_022E': 'bachelors_degree_plus',
     'B25003_002E': 'owner_occupied_housing',
-    'B08301_010E': 'work_from_home',
-    'B19001_017E': 'households_200k_plus'
+    'B25003_001E': 'total_occupied_housing', // Need this for percentage calculation
+    'B15003_022E': 'bachelors_degree',
+    'B15003_023E': 'masters_degree', 
+    'B15003_024E': 'professional_degree',
+    'B15003_025E': 'doctorate_degree',
+    'B15003_001E': 'total_education_population', // Base population for education percentages
+    'B08303_013E': 'commute_30_34_minutes',
+    'B08303_014E': 'commute_35_plus_minutes', 
+    'B08303_001E': 'total_commuters', // Base population for commute percentages
+    'B08006_017E': 'work_from_home',
+    'B19001_017E': 'households_200k_plus',
+    'B19001_001E': 'total_households' // Base for household income percentages
 };
 
-// Geocoding function
+// Geocoding function - UNCHANGED from your original
 async function geocodeAddress(address) {
     const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
     if (!GOOGLE_API_KEY) {
@@ -68,12 +76,12 @@ async function geocodeAddress(address) {
     return null;
 }
 
-// Helper function to create shopping center key
+// Helper function to create shopping center key - UNCHANGED
 function createShoppingCenterKey(name) {
     return name.toLowerCase().trim();
 }
 
-// Helper function to create tenant key
+// Helper function to create tenant key - UNCHANGED
 function createTenantKey(centerName, tenantName, suiteNumber = '') {
     if (tenantName === 'Vacant') {
         // For vacant spaces, make each one unique by including suite number
@@ -82,56 +90,115 @@ function createTenantKey(centerName, tenantName, suiteNumber = '') {
     return `${centerName.toLowerCase().trim()}::${tenantName.toLowerCase().trim()}`;
 }
 
-// Demographic Functions
-
-// Get Census Block Groups within radius
+// UPDATED: Improved function to get Census Block Groups within radius
 async function getCensusBlockGroups(lat, lng, radiusMiles) {
     try {
         const fetch = await import('node-fetch').then(mod => mod.default);
         
-        // Convert miles to meters for turf calculations
-        const radiusMeters = radiusMiles * 1609.34;
+        console.log(`Getting block groups for coordinates: ${lat}, ${lng}, radius: ${radiusMiles} miles`);
         
-        // Create a point and buffer around it
-        const center = turf.point([lng, lat]);
-        const buffer = turf.buffer(center, radiusMeters, { units: 'meters' });
+        // Step 1: Get state and county for the center point using geocoding API
+        const geoUrl = `https://geocoding.geo.census.gov/geocoder/geographies/coordinates?x=${lng}&y=${lat}&benchmark=Public_AR_Current&vintage=Current_Current&format=json`;
         
-        // Get state and county for the center point
-        const geoResponse = await fetch(
-            `https://geocoding.geo.census.gov/geocoder/geographies/coordinates?x=${lng}&y=${lat}&benchmark=2020&vintage=2020&format=json`
-        );
-        const geoData = await geoResponse.json();
+        console.log(`Geocoding URL: ${geoUrl}`);
         
-        if (!geoData.result || !geoData.result.geographies) {
-            throw new Error('Unable to determine census geography');
+        const geoResponse = await fetch(geoUrl);
+        
+        // Check if geocoding response is valid
+        if (!geoResponse.ok) {
+            console.error(`Geocoding API returned status: ${geoResponse.status}`);
+            const errorText = await geoResponse.text();
+            console.error(`Geocoding error response: ${errorText.substring(0, 200)}`);
+            return [];
         }
         
-        const state = geoData.result.geographies.States[0].STATE;
+        const geoText = await geoResponse.text();
+        console.log(`Geocoding raw response: ${geoText.substring(0, 300)}`);
+        
+        let geoData;
+        try {
+            geoData = JSON.parse(geoText);
+        } catch (parseError) {
+            console.error('Geocoding response is not valid JSON:', parseError.message);
+            console.error('Response text:', geoText.substring(0, 500));
+            return [];
+        }
+        
+        // Validate geocoding response structure
+        if (!geoData.result?.geographies?.Counties?.[0]) {
+            console.error('Invalid geocoding response structure:', JSON.stringify(geoData, null, 2));
+            return [];
+        }
+        
+        const state = geoData.result.geographies.Counties[0].STATE;
         const county = geoData.result.geographies.Counties[0].COUNTY;
         
-        // Get all block groups in the county
-        const blockGroupsResponse = await fetch(
-            `https://api.census.gov/data/2023/acs/acs5?get=NAME&for=block%20group:*&in=state:${state}%20county:${county}&key=${CENSUS_API_KEY}`
-        );
+        console.log(`Found state: ${state}, county: ${county}`);
+        
+        // Step 2: Get all block groups in the county using correct API format
+        const censusUrl = `${CENSUS_BASE_URL}?get=NAME&for=block%20group:*&in=state:${state}%20county:${county}`;
+        
+        // Add API key if available
+        const finalCensusUrl = CENSUS_API_KEY ? `${censusUrl}&key=${CENSUS_API_KEY}` : censusUrl;
+        
+        console.log(`Census block groups URL: ${finalCensusUrl}`);
+        
+        const blockGroupsResponse = await fetch(finalCensusUrl);
+        
+        // Check response status and content type
+        console.log(`Census API response status: ${blockGroupsResponse.status}`);
+        console.log(`Census API response content-type: ${blockGroupsResponse.headers.get('content-type')}`);
         
         if (!blockGroupsResponse.ok) {
-            throw new Error('Failed to fetch block groups from Census API');
+            const errorText = await blockGroupsResponse.text();
+            console.error(`Census API error (${blockGroupsResponse.status}): ${errorText.substring(0, 500)}`);
+            return [];
         }
         
-        const blockGroupsData = await blockGroupsResponse.json();
+        const responseText = await blockGroupsResponse.text();
+        console.log(`Census API raw response: ${responseText.substring(0, 300)}`);
         
-        // Filter to only include block groups (skip header row)
+        // Check if response looks like JSON (starts with [ or {)
+        if (!responseText.trim().startsWith('[') && !responseText.trim().startsWith('{')) {
+            console.error('Census API returned non-JSON response (probably HTML error page)');
+            console.error('Response content:', responseText.substring(0, 500));
+            return [];
+        }
+        
+        let blockGroupsData;
+        try {
+            blockGroupsData = JSON.parse(responseText);
+        } catch (parseError) {
+            console.error('Census API response is not valid JSON:', parseError.message);
+            console.error('Response text:', responseText.substring(0, 500));
+            return [];
+        }
+        
+        // Validate Census API response structure
+        if (!Array.isArray(blockGroupsData) || blockGroupsData.length < 2) {
+            console.error('Invalid Census API response structure:', blockGroupsData);
+            return [];
+        }
+        
+        // Process block groups (skip header row)
         const blockGroups = blockGroupsData.slice(1).map(row => ({
             name: row[0],
             state: row[1],
-            county: row[2],
+            county: row[2], 
             tract: row[3],
-            blockGroup: row[4]
+            blockGroup: row[4],
+            geoid: `${row[1]}${row[2]}${row[3]}${row[4]}` // Create full GEOID
         }));
         
-        // For simplicity, return all block groups in the county
-        // In production, you'd want to do proper geometric intersection
-        return blockGroups;
+        console.log(`Found ${blockGroups.length} block groups in county`);
+        
+        // For now, return first 20 block groups to avoid API limits
+        // In production, you'd want to implement proper geographic filtering
+        const limitedBlockGroups = blockGroups.slice(0, 20);
+        
+        console.log(`Returning ${limitedBlockGroups.length} block groups for analysis`);
+        
+        return limitedBlockGroups;
         
     } catch (error) {
         console.error('Error getting census block groups:', error);
@@ -139,23 +206,50 @@ async function getCensusBlockGroups(lat, lng, radiusMiles) {
     }
 }
 
-// Fetch demographics for a specific block group
+// UPDATED: Improved function to fetch demographics for a specific block group
 async function fetchBlockGroupDemographics(state, county, tract, blockGroup) {
     try {
         const fetch = await import('node-fetch').then(mod => mod.default);
         const variables = Object.keys(DEMOGRAPHIC_VARIABLES).join(',');
         
-        const url = `${CENSUS_BASE_URL}?get=${variables}&for=block%20group:${blockGroup}&in=state:${state}%20county:${county}%20tract:${tract}&key=${CENSUS_API_KEY}`;
+        // Construct URL with proper formatting
+        const baseUrl = `${CENSUS_BASE_URL}?get=${variables}&for=block%20group:${blockGroup}&in=state:${state}%20county:${county}%20tract:${tract}`;
+        const url = CENSUS_API_KEY ? `${baseUrl}&key=${CENSUS_API_KEY}` : baseUrl;
+        
+        console.log(`Fetching demographics for block group ${state}${county}${tract}${blockGroup}`);
+        console.log(`Demographics URL: ${url}`);
         
         const response = await fetch(url);
+        
+        // Enhanced error checking
         if (!response.ok) {
-            throw new Error(`Census API request failed: ${response.status}`);
+            console.error(`Demographics API error (${response.status}) for block group ${state}${county}${tract}${blockGroup}`);
+            const errorText = await response.text();
+            console.error(`Error response: ${errorText.substring(0, 300)}`);
+            return null;
         }
         
-        const data = await response.json();
+        const responseText = await response.text();
         
-        if (data.length < 2) {
-            return null; // No data available
+        // Check if response is JSON
+        if (!responseText.trim().startsWith('[')) {
+            console.error(`Non-JSON response for block group ${state}${county}${tract}${blockGroup}`);
+            console.error(`Response: ${responseText.substring(0, 300)}`);
+            return null;
+        }
+        
+        let data;
+        try {
+            data = JSON.parse(responseText);
+        } catch (parseError) {
+            console.error(`JSON parse error for block group ${state}${county}${tract}${blockGroup}:`, parseError.message);
+            return null;
+        }
+        
+        // Validate response structure
+        if (!Array.isArray(data) || data.length < 2) {
+            console.error(`Invalid data structure for block group ${state}${county}${tract}${blockGroup}:`, data);
+            return null;
         }
         
         // Parse the response (first row is headers, second row is data)
@@ -163,20 +257,31 @@ async function fetchBlockGroupDemographics(state, county, tract, blockGroup) {
         const values = data[1];
         
         const demographics = {};
-        Object.keys(DEMOGRAPHIC_VARIABLES).forEach((variable, index) => {
-            const value = values[index];
-            demographics[DEMOGRAPHIC_VARIABLES[variable]] = value === null ? 0 : parseInt(value) || 0;
+        
+        // Process each variable
+        Object.keys(DEMOGRAPHIC_VARIABLES).forEach((variable) => {
+            const index = headers.indexOf(variable);
+            if (index !== -1) {
+                const value = values[index];
+                // Handle Census null values and negative values (which indicate missing data)
+                const numericValue = (value === null || value < 0) ? 0 : parseInt(value) || 0;
+                demographics[DEMOGRAPHIC_VARIABLES[variable]] = numericValue;
+            } else {
+                demographics[DEMOGRAPHIC_VARIABLES[variable]] = 0;
+            }
         });
+        
+        console.log(`Successfully fetched demographics for block group ${state}${county}${tract}${blockGroup}`);
         
         return demographics;
         
     } catch (error) {
-        console.error('Error fetching block group demographics:', error);
+        console.error(`Error fetching block group demographics for ${state}${county}${tract}${blockGroup}:`, error);
         return null;
     }
 }
 
-// Aggregate demographics across multiple block groups
+// UPDATED: Enhanced aggregation function with proper percentage calculations
 function aggregateDemographics(demographicsArray, radiusMiles) {
     const validDemographics = demographicsArray.filter(d => d !== null);
     
@@ -186,64 +291,94 @@ function aggregateDemographics(demographicsArray, radiusMiles) {
             total_population: 0,
             median_household_income: 0,
             total_housing_units: 0,
-            commute_30_plus_minutes: 0,
-            bachelors_degree_plus: 0,
-            owner_occupied_housing: 0,
-            work_from_home: 0,
-            households_200k_plus: 0,
+            owner_occupied_percent: 0.0,
+            commute_30_plus_percent: 0.0,
+            bachelors_degree_percent: 0.0,
+            work_from_home_percent: 0.0,
+            households_200k_percent: 0.0,
             block_groups_analyzed: 0
         };
     }
     
-    // Sum all the counts
-    const totals = validDemographics.reduce((acc, demo) => {
-        Object.keys(demo).forEach(key => {
-            if (key !== 'median_household_income') {
-                acc[key] = (acc[key] || 0) + demo[key];
+    // Sum all the demographic counts
+    const totals = {
+        total_population: 0,
+        total_housing_units: 0,
+        owner_occupied_housing: 0,
+        total_occupied_housing: 0,
+        bachelors_degree: 0,
+        masters_degree: 0,
+        professional_degree: 0,
+        doctorate_degree: 0,
+        total_education_population: 0,
+        commute_30_34_minutes: 0,
+        commute_35_plus_minutes: 0,
+        total_commuters: 0,
+        work_from_home: 0,
+        households_200k_plus: 0,
+        total_households: 0,
+        median_income_sum: 0,
+        median_income_count: 0
+    };
+    
+    // Aggregate all demographic data
+    validDemographics.forEach(demo => {
+        Object.keys(totals).forEach(key => {
+            if (demo[key] !== undefined) {
+                totals[key] += demo[key];
             }
         });
-        return acc;
-    }, {});
+        
+        // For median income, we need to weight by population
+        if (demo.median_household_income > 0) {
+            totals.median_income_sum += demo.median_household_income * demo.total_population;
+            totals.median_income_count += demo.total_population;
+        }
+    });
     
-    // Calculate weighted median income (simplified approach)
-    const incomes = validDemographics
-        .map(d => d.median_household_income)
-        .filter(income => income > 0);
+    // Calculate percentages with proper denominators
+    const ownerOccupiedPercent = totals.total_occupied_housing > 0 
+        ? Math.round((totals.owner_occupied_housing / totals.total_occupied_housing) * 100 * 10) / 10
+        : 0.0;
     
-    const medianIncome = incomes.length > 0 
-        ? Math.round(incomes.reduce((sum, income) => sum + income, 0) / incomes.length)
+    const bachelorsPlusCount = totals.bachelors_degree + totals.masters_degree + 
+                             totals.professional_degree + totals.doctorate_degree;
+    const bachelorsPercent = totals.total_education_population > 0
+        ? Math.round((bachelorsPlusCount / totals.total_education_population) * 100 * 10) / 10
+        : 0.0;
+    
+    const commutePlusCount = totals.commute_30_34_minutes + totals.commute_35_plus_minutes;
+    const commutePercent = totals.total_commuters > 0
+        ? Math.round((commutePlusCount / totals.total_commuters) * 100 * 10) / 10
+        : 0.0;
+    
+    const workFromHomePercent = totals.total_commuters > 0
+        ? Math.round((totals.work_from_home / totals.total_commuters) * 100 * 10) / 10
+        : 0.0;
+    
+    const households200kPercent = totals.total_households > 0
+        ? Math.round((totals.households_200k_plus / totals.total_households) * 100 * 10) / 10
+        : 0.0;
+    
+    const weightedMedianIncome = totals.median_income_count > 0
+        ? Math.round(totals.median_income_sum / totals.median_income_count)
         : 0;
     
     return {
         radius: radiusMiles,
-        total_population: totals.total_population || 0,
-        median_household_income: medianIncome,
-        total_housing_units: totals.total_housing_units || 0,
-        commute_30_plus_minutes: totals.commute_30_plus_minutes || 0,
-        commute_30_plus_percent: totals.total_population > 0 
-            ? Math.round((totals.commute_30_plus_minutes / totals.total_population) * 100) 
-            : 0,
-        bachelors_degree_plus: totals.bachelors_degree_plus || 0,
-        bachelors_degree_percent: totals.total_population > 0 
-            ? Math.round((totals.bachelors_degree_plus / totals.total_population) * 100) 
-            : 0,
-        owner_occupied_housing: totals.owner_occupied_housing || 0,
-        owner_occupied_percent: totals.total_housing_units > 0 
-            ? Math.round((totals.owner_occupied_housing / totals.total_housing_units) * 100) 
-            : 0,
-        work_from_home: totals.work_from_home || 0,
-        work_from_home_percent: totals.total_population > 0 
-            ? Math.round((totals.work_from_home / totals.total_population) * 100) 
-            : 0,
-        households_200k_plus: totals.households_200k_plus || 0,
-        households_200k_percent: totals.total_housing_units > 0 
-            ? Math.round((totals.households_200k_plus / totals.total_housing_units) * 100) 
-            : 0,
+        total_population: totals.total_population,
+        median_household_income: weightedMedianIncome,
+        total_housing_units: totals.total_housing_units,
+        owner_occupied_percent: ownerOccupiedPercent,
+        commute_30_plus_percent: commutePercent,
+        bachelors_degree_percent: bachelorsPercent,
+        work_from_home_percent: workFromHomePercent,
+        households_200k_percent: households200kPercent,
         block_groups_analyzed: validDemographics.length
     };
 }
 
-// API Routes
+// API Routes - ALL UNCHANGED from your original
 
 // Get all shopping centers with basic info
 app.get('/api/shopping-centers/', (req, res) => {
@@ -319,7 +454,7 @@ app.get('/api/shopping-centers/:id/vacancy-stats', (req, res) => {
     });
 });
 
-// NEW: Get demographics for a radius around a point
+// UPDATED: Demographics endpoint with enhanced error handling and logging
 app.get('/api/demographics/:lat/:lng/:radius', async (req, res) => {
     const { lat, lng, radius } = req.params;
     const latitude = parseFloat(lat);
@@ -332,7 +467,8 @@ app.get('/api/demographics/:lat/:lng/:radius', async (req, res) => {
     }
     
     if (!CENSUS_API_KEY) {
-        return res.status(503).json({ error: 'Census API key not configured' });
+        console.warn('Census API key not configured - demographics may have limited functionality');
+        // Don't return error immediately - Census API works without key but with rate limits
     }
     
     try {
@@ -346,7 +482,14 @@ app.get('/api/demographics/:lat/:lng/:radius', async (req, res) => {
                 radius: radiusMiles,
                 error: 'No census data available for this area',
                 total_population: 0,
-                median_household_income: 0
+                median_household_income: 0,
+                total_housing_units: 0,
+                owner_occupied_percent: 0.0,
+                commute_30_plus_percent: 0.0,
+                bachelors_degree_percent: 0.0,
+                work_from_home_percent: 0.0,
+                households_200k_percent: 0.0,
+                block_groups_analyzed: 0
             });
         }
         
@@ -376,13 +519,13 @@ app.get('/api/demographics/:lat/:lng/:radius', async (req, res) => {
     }
 });
 
-// File upload setup
+// File upload setup - UNCHANGED
 const upload = multer({ 
     storage: multer.memoryStorage(),
     limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
 });
 
-// CSV Import endpoint
+// CSV Import endpoint - UNCHANGED from your original
 app.post('/api/import-csv-v3/', upload.single('file'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: 'No file uploaded' });
@@ -526,18 +669,19 @@ app.post('/api/import-csv-v3/', upload.single('file'), async (req, res) => {
     }
 });
 
-// Health check endpoint
+// Health check endpoint - UPDATED to show Census API configuration status
 app.get('/health', (req, res) => {
     res.json({ 
         status: 'OK', 
         timestamp: new Date().toISOString(),
         shopping_centers: shoppingCenters.size,
         tenant_spaces: tenants.size,
-        census_api_configured: !!CENSUS_API_KEY
+        census_api_configured: !!CENSUS_API_KEY,
+        census_api_base_url: CENSUS_BASE_URL
     });
 });
 
-// Root endpoint
+// Root endpoint - UNCHANGED
 app.get('/', (req, res) => {
     res.json({ 
         message: 'ShopWindow API - Simple & Fast with Demographics',
@@ -553,12 +697,13 @@ app.get('/', (req, res) => {
     });
 });
 
-// Start server
+// Start server - UPDATED to show Census API configuration in startup logs
 app.listen(PORT, () => {
     console.log(`ShopWindow API running on port ${PORT}`);
     console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log(`Google Maps API: ${process.env.GOOGLE_MAPS_API_KEY ? 'Configured' : 'Not configured'}`);
-    console.log(`Census API: ${CENSUS_API_KEY ? 'Configured' : 'Not configured'}`);
+    console.log(`Census API: ${CENSUS_API_KEY ? 'Configured with API key' : 'Not configured (will use public access with rate limits)'}`);
+    console.log(`Census API Base URL: ${CENSUS_BASE_URL}`);
 });
 
 module.exports = app;
