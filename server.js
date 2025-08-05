@@ -22,24 +22,22 @@ let tenants = new Map(); // key: center_name + tenant_name (or unique for vacant
 const CENSUS_API_KEY = process.env.CENSUS_API_KEY;
 const CENSUS_BASE_URL = 'https://api.census.gov/data/2022/acs/acs5';
 
-// UPDATED: Demographic variables with proper Census codes and base populations for percentage calculations
+// UPDATED: Demographic variables - using only commonly available block group variables
 const DEMOGRAPHIC_VARIABLES = {
     'B01003_001E': 'total_population',
     'B19013_001E': 'median_household_income', 
     'B25001_001E': 'total_housing_units',
     'B25003_002E': 'owner_occupied_housing',
-    'B25003_001E': 'total_occupied_housing', // Need this for percentage calculation
+    'B25003_001E': 'total_occupied_housing',
     'B15003_022E': 'bachelors_degree',
     'B15003_023E': 'masters_degree', 
     'B15003_024E': 'professional_degree',
     'B15003_025E': 'doctorate_degree',
-    'B15003_001E': 'total_education_population', // Base population for education percentages
-    'B08303_013E': 'commute_30_34_minutes',
-    'B08303_014E': 'commute_35_plus_minutes', 
-    'B08303_001E': 'total_commuters', // Base population for commute percentages
+    'B15003_001E': 'total_education_population',
     'B08006_017E': 'work_from_home',
+    'B08301_001E': 'total_workers', // Base for work from home percentage
     'B19001_017E': 'households_200k_plus',
-    'B19001_001E': 'total_households' // Base for household income percentages
+    'B19001_001E': 'total_households'
 };
 
 // Geocoding function - UNCHANGED from your original
@@ -292,7 +290,6 @@ function aggregateDemographics(demographicsArray, radiusMiles) {
             median_household_income: 0,
             total_housing_units: 0,
             owner_occupied_percent: 0.0,
-            commute_30_plus_percent: 0.0,
             bachelors_degree_percent: 0.0,
             work_from_home_percent: 0.0,
             households_200k_percent: 0.0,
@@ -311,10 +308,8 @@ function aggregateDemographics(demographicsArray, radiusMiles) {
         professional_degree: 0,
         doctorate_degree: 0,
         total_education_population: 0,
-        commute_30_34_minutes: 0,
-        commute_35_plus_minutes: 0,
-        total_commuters: 0,
         work_from_home: 0,
+        total_workers: 0,
         households_200k_plus: 0,
         total_households: 0,
         median_income_sum: 0,
@@ -347,13 +342,12 @@ function aggregateDemographics(demographicsArray, radiusMiles) {
         ? Math.round((bachelorsPlusCount / totals.total_education_population) * 100 * 10) / 10
         : 0.0;
     
-    const commutePlusCount = totals.commute_30_34_minutes + totals.commute_35_plus_minutes;
-    const commutePercent = totals.total_commuters > 0
-        ? Math.round((commutePlusCount / totals.total_commuters) * 100 * 10) / 10
+    const bachelorsPercent = totals.total_education_population > 0
+        ? Math.round((bachelorsPlusCount / totals.total_education_population) * 100 * 10) / 10
         : 0.0;
     
-    const workFromHomePercent = totals.total_commuters > 0
-        ? Math.round((totals.work_from_home / totals.total_commuters) * 100 * 10) / 10
+    const workFromHomePercent = totals.total_workers > 0
+        ? Math.round((totals.work_from_home / totals.total_workers) * 100 * 10) / 10
         : 0.0;
     
     const households200kPercent = totals.total_households > 0
@@ -370,7 +364,6 @@ function aggregateDemographics(demographicsArray, radiusMiles) {
         median_household_income: weightedMedianIncome,
         total_housing_units: totals.total_housing_units,
         owner_occupied_percent: ownerOccupiedPercent,
-        commute_30_plus_percent: commutePercent,
         bachelors_degree_percent: bachelorsPercent,
         work_from_home_percent: workFromHomePercent,
         households_200k_percent: households200kPercent,
@@ -485,7 +478,6 @@ app.get('/api/demographics/:lat/:lng/:radius', async (req, res) => {
                 median_household_income: 0,
                 total_housing_units: 0,
                 owner_occupied_percent: 0.0,
-                commute_30_plus_percent: 0.0,
                 bachelors_degree_percent: 0.0,
                 work_from_home_percent: 0.0,
                 households_200k_percent: 0.0,
