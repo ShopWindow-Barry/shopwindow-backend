@@ -34,69 +34,6 @@ const DEMOGRAPHIC_VARIABLES = {
     'B19001_017E': 'households_200k_plus'
 };
 
-// Helper function to normalize shopping center types
-function normalizeCenterType(centerType) {
-    /*
-    Normalize shopping center type to match ALL 9 planned categories.
-    This supports your current 4 types plus 5 future types you may add.
-    When you add new types to your CSV, they'll be automatically recognized.
-    */
-    if (!centerType || typeof centerType !== 'string' || centerType.trim() === '') {
-        return null;
-    }
-    
-    const typeStr = centerType.trim();
-    if (!typeStr) {
-        return null;
-    }
-    
-    // Define ALL 9 valid types
-    const validTypes = [
-        'Super Regional Mall',
-        'Regional Mall', 
-        'Community Center',
-        'Neighborhood Center',
-        'Strip/Convenience',
-        'Power Center',
-        'Lifestyle Center',
-        'Factory Outlet',
-        'Theme/Festival'
-    ];
-    
-    // Try exact match first (case-insensitive)
-    const typeLower = typeStr.toLowerCase();
-    for (const validType of validTypes) {
-        if (typeLower === validType.toLowerCase()) {
-            return validType;
-        }
-    }
-    
-    // Try common variations
-    if (typeLower.includes('strip') || typeLower.includes('convenience')) {
-        return 'Strip/Convenience';
-    } else if (typeLower.includes('power')) {
-        return 'Power Center';
-    } else if (typeLower.includes('lifestyle')) {
-        return 'Lifestyle Center';
-    } else if (typeLower.includes('community')) {
-        return 'Community Center';
-    } else if (typeLower.includes('neighborhood') || typeLower.includes('neighbourhood')) {
-        return 'Neighborhood Center';
-    } else if (typeLower.includes('regional') && !typeLower.includes('super')) {
-        return 'Regional Mall';
-    } else if (typeLower.includes('super') && typeLower.includes('regional')) {
-        return 'Super Regional Mall';
-    } else if (typeLower.includes('factory') || typeLower.includes('outlet')) {
-        return 'Factory Outlet';
-    } else if (typeLower.includes('theme') || typeLower.includes('festival')) {
-        return 'Theme/Festival';
-    }
-    
-    // Return the original value if we can't match it
-    console.warn(`Unknown shopping center type: ${typeStr}`);
-    return typeStr;
-}
-
 // Geocoding function
 async function geocodeAddress(address) {
     const GOOGLE_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
@@ -145,10 +82,36 @@ function createTenantKey(centerName, tenantName, suiteNumber = '') {
     return `${centerName.toLowerCase().trim()}::${tenantName.toLowerCase().trim()}`;
 }
 
-// FIXED: Get Census Block Groups within radius with proper geographic filtering
+// Helper function to normalize tenant names (handle variations of "Vacant")
+function normalizeTenantName(tenantName) {
+    if (!tenantName || tenantName.trim() === '') {
+        return 'Vacant';
+    }
+    
+    const normalized = tenantName.trim();
+    const lowerCase = normalized.toLowerCase();
+    
+    // Check for various vacant indicators
+    if (lowerCase.includes('vacant') || lowerCase.includes('empty') || lowerCase === '') {
+        return 'Vacant';
+    }
+    
+    return normalized;
+}
+
+// Demographic Functions
+
+// Get Census Block Groups within radius
 async function getCensusBlockGroups(lat, lng, radiusMiles) {
     try {
         const fetch = await import('node-fetch').then(mod => mod.default);
+        
+        // Convert miles to meters for turf calculations
+        const radiusMeters = radiusMiles * 1609.34;
+        
+        // Create a point and buffer around it
+        const center = turf.point([lng, lat]);
+        const buffer = turf.buffer(center, radiusMeters, { units: 'meters' });
         
         // Get state and county for the center point
         const geoResponse = await fetch(
@@ -165,7 +128,7 @@ async function getCensusBlockGroups(lat, lng, radiusMiles) {
         
         // Get all block groups in the county
         const blockGroupsResponse = await fetch(
-            `https://api.census.gov/data/2023/acs/acs5?get=NAME,GEO_ID&for=block%20group:*&in=state:${state}%20county:${county}&key=${CENSUS_API_KEY}`
+            `https://api.census.gov/data/2023/acs/acs5?get=NAME&for=block%20group:*&in=state:${state}%20county:${county}&key=${CENSUS_API_KEY}`
         );
         
         if (!blockGroupsResponse.ok) {
@@ -174,75 +137,18 @@ async function getCensusBlockGroups(lat, lng, radiusMiles) {
         
         const blockGroupsData = await blockGroupsResponse.json();
         
-        // Process block groups and filter by distance
-        const allBlockGroups = blockGroupsData.slice(1).map(row => ({
+        // Filter to only include block groups (skip header row)
+        const blockGroups = blockGroupsData.slice(1).map(row => ({
             name: row[0],
-            geo_id: row[1],
-            state: row[2],
-            county: row[3],
-            tract: row[4],
-            blockGroup: row[5]
+            state: row[1],
+            county: row[2],
+            tract: row[3],
+            blockGroup: row[4]
         }));
         
-        // FIXED: Actually filter block groups by distance from center point
-        const filteredBlockGroups = [];
-        const radiusMeters = radiusMiles * 1609.34; // Convert miles to meters
-        
-        for (const bg of allBlockGroups) {
-            try {
-                // Get block group centroid coordinates
-                const bgCentroidResponse = await fetch(
-                    `https://geocoding.geo.census.gov/geocoder/geographies/coordinates?x=${lng}&y=${lat}&benchmark=2020&vintage=2020&format=json&layers=14`
-                );
-                
-                // For simplicity and performance, we'll use a statistical approach:
-                // Sample block groups based on their relationship to the center point
-                // In a full production system, you'd use the actual geographic boundaries
-                
-                // Calculate approximate distance using block group identifier patterns
-                // Block groups closer to the center point tend to have similar geographic identifiers
-                const bgNumber = parseInt(bg.blockGroup);
-                const tractNumber = parseInt(bg.tract);
-                
-                // Use a simplified distance approximation based on tract/block group numbering
-                // This is a reasonable approximation for demographic analysis
-                const estimatedDistance = Math.abs(bgNumber - 1) * 0.5 + Math.random() * 0.5; // Rough approximation in miles
-                
-                if (estimatedDistance <= radiusMiles) {
-                    filteredBlockGroups.push(bg);
-                }
-                
-                // Alternatively, if we have more time, we could implement proper centroid distance calculation
-                // But for now, this gives us realistic variation between different radii
-                
-            } catch (error) {
-                console.warn(`Could not process block group ${bg.geo_id}:`, error.message);
-                // Include it if we can't determine distance (conservative approach)
-                if (filteredBlockGroups.length < radiusMiles * 3) { // Rough heuristic
-                    filteredBlockGroups.push(bg);
-                }
-            }
-        }
-        
-        // Ensure we have reasonable number of block groups for each radius
-        const minBlockGroups = Math.max(1, Math.floor(radiusMiles * 2));
-        const maxBlockGroups = Math.floor(radiusMiles * 8);
-        
-        // If we have too few, add some more (rural areas)
-        while (filteredBlockGroups.length < minBlockGroups && filteredBlockGroups.length < allBlockGroups.length) {
-            const additionalBG = allBlockGroups[filteredBlockGroups.length];
-            if (!filteredBlockGroups.includes(additionalBG)) {
-                filteredBlockGroups.push(additionalBG);
-            }
-        }
-        
-        // If we have too many, trim to reasonable number (urban areas)
-        if (filteredBlockGroups.length > maxBlockGroups) {
-            filteredBlockGroups.splice(maxBlockGroups);
-        }
-        
-        console.log(`Filtered to ${filteredBlockGroups.length} block groups for ${radiusMiles}-mile radius`);
-        return filteredBlockGroups;
+        // For simplicity, return all block groups in the county
+        // In production, you'd want to do proper geometric intersection
+        return blockGroups;
         
     } catch (error) {
         console.error('Error getting census block groups:', error);
@@ -356,12 +262,11 @@ function aggregateDemographics(demographicsArray, radiusMiles) {
 
 // API Routes
 
-// Get all shopping centers with basic info (UPDATED to include center_type)
+// Get all shopping centers with basic info
 app.get('/api/shopping-centers/', (req, res) => {
     const centers = Array.from(shoppingCenters.values()).map(center => ({
         id: center.id,
         name: center.name,
-        center_type: center.center_type,  // NEW: Include center_type in response
         address_street: center.address_street,
         address_city: center.address_city,
         address_state: center.address_state,
@@ -371,6 +276,7 @@ app.get('/api/shopping-centers/', (req, res) => {
         owner: center.owner,
         property_manager: center.property_manager,
         total_gla: center.total_gla,
+        center_type: center.center_type,
         latitude: center.latitude,
         longitude: center.longitude
     }));
@@ -404,7 +310,7 @@ app.get('/api/shopping-centers/:id/tenants', (req, res) => {
     res.json(centerTenants);
 });
 
-// Get vacancy statistics for a shopping center
+// UPDATED: Get vacancy statistics for a shopping center with improved error handling
 app.get('/api/shopping-centers/:id/vacancy-stats', (req, res) => {
     const centerId = req.params.id;
     const center = Array.from(shoppingCenters.values()).find(c => c.id === centerId);
@@ -420,17 +326,81 @@ app.get('/api/shopping-centers/:id/vacancy-stats', (req, res) => {
     const totalSpaces = centerSpaces.length;
     const vacantSpaces = centerSpaces.filter(space => space.tenant_name === 'Vacant').length;
     const occupiedSpaces = totalSpaces - vacantSpaces;
-    const vacancyRate = totalSpaces > 0 ? Math.round((vacantSpaces / totalSpaces) * 100) : 0;
+    
+    // Calculate vacancy rate by count (for reference)
+    const vacancyRateByCount = totalSpaces > 0 ? Math.round((vacantSpaces / totalSpaces) * 100) : 0;
+    
+    // Get total GLA from shopping center
+    const totalGLA = center.total_gla || 0;
+    
+    // Check if we have the necessary data for GLA-based calculation
+    const canCalculateGLAVacancy = totalGLA > 0;
+    
+    // Sum up square footage of vacant spaces
+    const vacantSpacesWithSqft = centerSpaces.filter(space => space.tenant_name === 'Vacant');
+    let vacantSquareFootage = 0;
+    let hasAllVacantSqft = true;
+    
+    for (const space of vacantSpacesWithSqft) {
+        const sqft = parseInt(space.square_footage);
+        if (isNaN(sqft) || sqft <= 0) {
+            hasAllVacantSqft = false;
+            break;
+        }
+        vacantSquareFootage += sqft;
+    }
+    
+    // Sum up total square footage of all spaces (for reference)
+    const spacesWithSqft = centerSpaces.filter(space => {
+        const sqft = parseInt(space.square_footage);
+        return !isNaN(sqft) && sqft > 0;
+    });
+    
+    const totalSquareFootage = spacesWithSqft.reduce((sum, space) => {
+        return sum + parseInt(space.square_footage);
+    }, 0);
+    
+    // Calculate vacancy rate by GLA: (Vacant GLA / Total GLA) * 100
+    let vacancyRateByGLA = null;
+    let vacancyStatus = 'available';
+    
+    if (!canCalculateGLAVacancy) {
+        vacancyStatus = 'unavailable_total_gla';
+    } else if (!hasAllVacantSqft) {
+        vacancyStatus = 'unavailable_vacant_sqft';
+    } else {
+        vacancyRateByGLA = parseFloat(((vacantSquareFootage / totalGLA) * 100).toFixed(2));
+    }
+
+    console.log(`Vacancy calculation for ${center.name}:`, {
+        totalGLA,
+        vacantSquareFootage,
+        hasAllVacantSqft,
+        canCalculateGLAVacancy,
+        vacancyRateByGLA,
+        vacancyStatus
+    });
 
     res.json({
         total_spaces: totalSpaces,
         vacant_spaces: vacantSpaces,
         occupied_spaces: occupiedSpaces,
-        vacancy_rate_by_count: vacancyRate
+        total_gla: totalGLA,
+        vacant_sq_ft: hasAllVacantSqft ? vacantSquareFootage : null,
+        total_sq_ft: totalSquareFootage,
+        vacancy_rate_by_count: vacancyRateByCount,
+        vacancy_rate_by_sqft: vacancyRateByGLA, // This is what the frontend expects
+        vacancy_status: vacancyStatus, // 'available', 'unavailable_total_gla', 'unavailable_vacant_sqft'
+        data_quality: {
+            has_total_gla: canCalculateGLAVacancy,
+            has_all_vacant_sqft: hasAllVacantSqft,
+            spaces_with_sqft: spacesWithSqft.length,
+            spaces_missing_sqft: totalSpaces - spacesWithSqft.length
+        }
     });
 });
 
-// FIXED: Get demographics for a radius around a point with proper geographic filtering
+// NEW: Get demographics for a radius around a point
 app.get('/api/demographics/:lat/:lng/:radius', async (req, res) => {
     const { lat, lng, radius } = req.params;
     const latitude = parseFloat(lat);
@@ -449,7 +419,7 @@ app.get('/api/demographics/:lat/:lng/:radius', async (req, res) => {
     try {
         console.log(`Fetching demographics for ${latitude}, ${longitude} within ${radiusMiles} miles`);
         
-        // Get census block groups within radius - NOW PROPERLY FILTERED
+        // Get census block groups within radius
         const blockGroups = await getCensusBlockGroups(latitude, longitude, radiusMiles);
         
         if (blockGroups.length === 0) {
@@ -457,15 +427,15 @@ app.get('/api/demographics/:lat/:lng/:radius', async (req, res) => {
                 radius: radiusMiles,
                 error: 'No census data available for this area',
                 total_population: 0,
-                median_household_income: 0,
-                block_groups_analyzed: 0
+                median_household_income: 0
             });
         }
         
-        console.log(`Processing ${blockGroups.length} block groups for ${radiusMiles}-mile radius`);
+        // Limit to first 10 block groups for performance (in production, you'd want better geographic filtering)
+        const limitedBlockGroups = blockGroups.slice(0, 10);
         
         // Fetch demographics for each block group
-        const demographicsPromises = blockGroups.map(bg => 
+        const demographicsPromises = limitedBlockGroups.map(bg => 
             fetchBlockGroupDemographics(bg.state, bg.county, bg.tract, bg.blockGroup)
         );
         
@@ -474,7 +444,7 @@ app.get('/api/demographics/:lat/:lng/:radius', async (req, res) => {
         // Aggregate the results
         const aggregatedDemographics = aggregateDemographics(demographicsArray, radiusMiles);
         
-        console.log(`Demographics aggregated from ${aggregatedDemographics.block_groups_analyzed} block groups for ${radiusMiles}-mile radius: ${aggregatedDemographics.total_population} population`);
+        console.log(`Demographics aggregated from ${aggregatedDemographics.block_groups_analyzed} block groups`);
         
         res.json(aggregatedDemographics);
         
@@ -493,7 +463,7 @@ const upload = multer({
     limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
 });
 
-// CSV Import endpoint (UPDATED to handle center_type)
+// CSV Import endpoint
 app.post('/api/import-csv-v3/', upload.single('file'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: 'No file uploaded' });
@@ -525,7 +495,6 @@ app.post('/api/import-csv-v3/', upload.single('file'), async (req, res) => {
             spaces_created: 0,
             tenants_created: 0,
             geocoded_centers: 0,
-            center_types_processed: {},  // NEW: Track center types processed
             errors: 0
         };
 
@@ -539,18 +508,6 @@ app.post('/api/import-csv-v3/', upload.single('file'), async (req, res) => {
                 }
 
                 const centerKey = createShoppingCenterKey(centerName);
-
-                // NEW: Process the center type
-                const centerTypeRaw = record.center_type?.trim();
-                const centerType = normalizeCenterType(centerTypeRaw) || null;
-                
-                // Track the types we're processing for reporting
-                if (centerType) {
-                    if (!stats.center_types_processed[centerType]) {
-                        stats.center_types_processed[centerType] = 0;
-                    }
-                    stats.center_types_processed[centerType]++;
-                }
 
                 // Create shopping center if it doesn't exist
                 if (!shoppingCenters.has(centerKey)) {
@@ -571,11 +528,9 @@ app.post('/api/import-csv-v3/', upload.single('file'), async (req, res) => {
                         }
                     }
 
-                    // UPDATED: Create shopping center with center_type
                     const newCenter = {
                         id: centerId,
                         name: centerName,
-                        center_type: centerType,  // NEW: Include center_type
                         address_street: record.address_street || '',
                         address_city: record.address_city || '',
                         address_state: record.address_state || 'PA',
@@ -585,6 +540,7 @@ app.post('/api/import-csv-v3/', upload.single('file'), async (req, res) => {
                         owner: record.owner || '',
                         property_manager: record.property_manager || '',
                         total_gla: parseInt(record.total_gla) || null,
+                        center_type: record.center_type || 'Not specified',
                         latitude: geoData?.latitude || null,
                         longitude: geoData?.longitude || null,
                         google_place_id: geoData?.google_place_id || record.google_place_id || null
@@ -600,7 +556,7 @@ app.post('/api/import-csv-v3/', upload.single('file'), async (req, res) => {
                 }
 
                 // Create tenant/space record
-                const tenantName = record.tenant_name?.trim() || 'Unknown';
+                const tenantName = normalizeTenantName(record.tenant_name?.trim() || 'Vacant');
                 const suiteNumber = record.tenant_suite_number?.trim() || '';
                 const tenantKey = createTenantKey(centerName, tenantName, suiteNumber);
 
@@ -637,17 +593,9 @@ app.post('/api/import-csv-v3/', upload.single('file'), async (req, res) => {
 
         console.log('Import completed:', stats);
 
-        // UPDATED: Enhanced response with center type information
         res.json({
             message: 'Import completed successfully',
-            details: {
-                shopping_centers_created: stats.shopping_centers_created,
-                spaces_created: stats.spaces_created,
-                tenants_created: stats.tenants_created,
-                geocoded_centers: stats.geocoded_centers,
-                center_types_processed: stats.center_types_processed,  // NEW: Include center types
-                errors: stats.errors
-            }
+            details: stats
         });
 
     } catch (error) {
@@ -666,16 +614,15 @@ app.get('/health', (req, res) => {
         timestamp: new Date().toISOString(),
         shopping_centers: shoppingCenters.size,
         tenant_spaces: tenants.size,
-        census_api_configured: !!CENSUS_API_KEY,
-        storage_type: 'in-memory'
+        census_api_configured: !!CENSUS_API_KEY
     });
 });
 
 // Root endpoint
 app.get('/', (req, res) => {
     res.json({ 
-        message: 'ShopWindow API - In-Memory Backend with Center Type Support',
-        version: '1.2.0',
+        message: 'ShopWindow API - Simple & Fast with Demographics',
+        version: '1.1.0',
         endpoints: [
             'GET /api/shopping-centers/',
             'GET /api/shopping-centers/:id/tenants',
@@ -683,8 +630,7 @@ app.get('/', (req, res) => {
             'GET /api/demographics/:lat/:lng/:radius',
             'POST /api/import-csv-v3/',
             'GET /health'
-        ],
-        note: 'Using in-memory storage - data will reset on server restart'
+        ]
     });
 });
 
@@ -694,7 +640,6 @@ app.listen(PORT, () => {
     console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log(`Google Maps API: ${process.env.GOOGLE_MAPS_API_KEY ? 'Configured' : 'Not configured'}`);
     console.log(`Census API: ${CENSUS_API_KEY ? 'Configured' : 'Not configured'}`);
-    console.log('Storage: In-memory (data resets on restart)');
 });
 
 module.exports = app;
