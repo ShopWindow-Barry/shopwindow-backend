@@ -82,23 +82,6 @@ function createTenantKey(centerName, tenantName, suiteNumber = '') {
     return `${centerName.toLowerCase().trim()}::${tenantName.toLowerCase().trim()}`;
 }
 
-// Helper function to normalize tenant names (handle variations of "Vacant")
-function normalizeTenantName(tenantName) {
-    if (!tenantName || tenantName.trim() === '') {
-        return 'Vacant';
-    }
-    
-    const normalized = tenantName.trim();
-    const lowerCase = normalized.toLowerCase();
-    
-    // Check for various vacant indicators
-    if (lowerCase.includes('vacant') || lowerCase.includes('empty') || lowerCase === '') {
-        return 'Vacant';
-    }
-    
-    return normalized;
-}
-
 // Demographic Functions
 
 // Get Census Block Groups within radius
@@ -310,7 +293,7 @@ app.get('/api/shopping-centers/:id/tenants', (req, res) => {
     res.json(centerTenants);
 });
 
-// UPDATED: Get vacancy statistics for a shopping center with improved error handling
+// Get vacancy statistics for a shopping center
 app.get('/api/shopping-centers/:id/vacancy-stats', (req, res) => {
     const centerId = req.params.id;
     const center = Array.from(shoppingCenters.values()).find(c => c.id === centerId);
@@ -326,77 +309,13 @@ app.get('/api/shopping-centers/:id/vacancy-stats', (req, res) => {
     const totalSpaces = centerSpaces.length;
     const vacantSpaces = centerSpaces.filter(space => space.tenant_name === 'Vacant').length;
     const occupiedSpaces = totalSpaces - vacantSpaces;
-    
-    // Calculate vacancy rate by count (for reference)
-    const vacancyRateByCount = totalSpaces > 0 ? Math.round((vacantSpaces / totalSpaces) * 100) : 0;
-    
-    // Get total GLA from shopping center
-    const totalGLA = center.total_gla || 0;
-    
-    // Check if we have the necessary data for GLA-based calculation
-    const canCalculateGLAVacancy = totalGLA > 0;
-    
-    // Sum up square footage of vacant spaces
-    const vacantSpacesWithSqft = centerSpaces.filter(space => space.tenant_name === 'Vacant');
-    let vacantSquareFootage = 0;
-    let hasAllVacantSqft = true;
-    
-    for (const space of vacantSpacesWithSqft) {
-        const sqft = parseInt(space.square_footage);
-        if (isNaN(sqft) || sqft <= 0) {
-            hasAllVacantSqft = false;
-            break;
-        }
-        vacantSquareFootage += sqft;
-    }
-    
-    // Sum up total square footage of all spaces (for reference)
-    const spacesWithSqft = centerSpaces.filter(space => {
-        const sqft = parseInt(space.square_footage);
-        return !isNaN(sqft) && sqft > 0;
-    });
-    
-    const totalSquareFootage = spacesWithSqft.reduce((sum, space) => {
-        return sum + parseInt(space.square_footage);
-    }, 0);
-    
-    // Calculate vacancy rate by GLA: (Vacant GLA / Total GLA) * 100
-    let vacancyRateByGLA = null;
-    let vacancyStatus = 'available';
-    
-    if (!canCalculateGLAVacancy) {
-        vacancyStatus = 'unavailable_total_gla';
-    } else if (!hasAllVacantSqft) {
-        vacancyStatus = 'unavailable_vacant_sqft';
-    } else {
-        vacancyRateByGLA = parseFloat(((vacantSquareFootage / totalGLA) * 100).toFixed(2));
-    }
-
-    console.log(`Vacancy calculation for ${center.name}:`, {
-        totalGLA,
-        vacantSquareFootage,
-        hasAllVacantSqft,
-        canCalculateGLAVacancy,
-        vacancyRateByGLA,
-        vacancyStatus
-    });
+    const vacancyRate = totalSpaces > 0 ? Math.round((vacantSpaces / totalSpaces) * 100) : 0;
 
     res.json({
         total_spaces: totalSpaces,
         vacant_spaces: vacantSpaces,
         occupied_spaces: occupiedSpaces,
-        total_gla: totalGLA,
-        vacant_sq_ft: hasAllVacantSqft ? vacantSquareFootage : null,
-        total_sq_ft: totalSquareFootage,
-        vacancy_rate_by_count: vacancyRateByCount,
-        vacancy_rate_by_sqft: vacancyRateByGLA, // This is what the frontend expects
-        vacancy_status: vacancyStatus, // 'available', 'unavailable_total_gla', 'unavailable_vacant_sqft'
-        data_quality: {
-            has_total_gla: canCalculateGLAVacancy,
-            has_all_vacant_sqft: hasAllVacantSqft,
-            spaces_with_sqft: spacesWithSqft.length,
-            spaces_missing_sqft: totalSpaces - spacesWithSqft.length
-        }
+        vacancy_rate_by_count: vacancyRate
     });
 });
 
@@ -556,7 +475,7 @@ app.post('/api/import-csv-v3/', upload.single('file'), async (req, res) => {
                 }
 
                 // Create tenant/space record
-                const tenantName = normalizeTenantName(record.tenant_name?.trim() || 'Vacant');
+                const tenantName = record.tenant_name?.trim() || 'Unknown';
                 const suiteNumber = record.tenant_suite_number?.trim() || '';
                 const tenantKey = createTenantKey(centerName, tenantName, suiteNumber);
 
@@ -607,6 +526,69 @@ app.post('/api/import-csv-v3/', upload.single('file'), async (req, res) => {
     }
 });
 
+// NEW: Export all data in FastAPI-compatible CSV format
+app.get('/api/export-all-data', (req, res) => {
+    console.log('Exporting all shopping center and tenant data...');
+    
+    const csvRows = [];
+    
+    // CSV header matching FastAPI import expectations
+    csvRows.push([
+        'shopping_center_name', 'center_type', 'address_street', 'address_city', 
+        'address_state', 'address_zip', 'county', 'municipality', 'owner', 
+        'property_manager', 'total_gla', 'tenant_name', 'tenant_suite_number', 
+        'square_footage', 'retail_category', 'base_rent'
+    ].join(','));
+
+    // Export each tenant record with shopping center details
+    for (const [tenantKey, tenant] of tenants.entries()) {
+        const centerName = tenant.shopping_center_name;
+        const centerKey = centerName.toLowerCase().trim();
+        const center = shoppingCenters.get(centerKey);
+        
+        if (center) {
+            // Escape quotes and wrap in quotes for CSV safety
+            const escapeCSV = (value) => {
+                if (value === null || value === undefined) return '';
+                const str = String(value);
+                if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+                    return `"${str.replace(/"/g, '""')}"`;
+                }
+                return str;
+            };
+            
+            const row = [
+                escapeCSV(centerName),
+                escapeCSV(center.center_type || ''),
+                escapeCSV(center.address_street || ''),
+                escapeCSV(center.address_city || ''),
+                escapeCSV(center.address_state || ''),
+                escapeCSV(center.address_zip || ''),
+                escapeCSV(center.county || ''),
+                escapeCSV(center.municipality || ''),
+                escapeCSV(center.owner || ''),
+                escapeCSV(center.property_manager || ''),
+                center.total_gla || '',
+                escapeCSV(tenant.tenant_name || ''),
+                escapeCSV(tenant.tenant_suite_number || ''),
+                tenant.square_footage || '',
+                escapeCSV(tenant.retail_category || ''),
+                tenant.base_rent || ''
+            ].join(',');
+            csvRows.push(row);
+        }
+    }
+
+    const csvContent = csvRows.join('\n');
+    
+    // Set headers for CSV download
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="shopwindow_export.csv"');
+    res.send(csvContent);
+    
+    console.log(`Exported ${csvRows.length - 1} records (${shoppingCenters.size} centers, ${tenants.size} spaces)`);
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.json({ 
@@ -628,6 +610,7 @@ app.get('/', (req, res) => {
             'GET /api/shopping-centers/:id/tenants',
             'GET /api/shopping-centers/:id/vacancy-stats',
             'GET /api/demographics/:lat/:lng/:radius',
+            'GET /api/export-all-data',
             'POST /api/import-csv-v3/',
             'GET /health'
         ]
